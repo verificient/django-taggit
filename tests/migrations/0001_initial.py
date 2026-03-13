@@ -7,7 +7,6 @@ import taggit.managers
 
 
 class Migration(migrations.Migration):
-
     initial = True
 
     dependencies = [
@@ -315,6 +314,7 @@ class Migration(migrations.Migration):
                         to="tests.OfficialTag",
                     ),
                 ),
+                ("extra_field", models.CharField(max_length=10)),
             ],
         ),
         migrations.CreateModel(

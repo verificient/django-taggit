@@ -1,20 +1,62 @@
+from django.conf import settings
 from django.contrib.contenttypes.fields import GenericForeignKey
 from django.contrib.contenttypes.models import ContentType
 from django.db import IntegrityError, models, router, transaction
 from django.utils.text import slugify
-from django.utils.translation import gettext, gettext_lazy as _
+from django.utils.translation import gettext
+from django.utils.translation import gettext_lazy as _
+from django.utils.translation import pgettext_lazy
 
 try:
     from unidecode import unidecode
-except ImportError:
 
-    def unidecode(tag):
+    unidecode_installed = True
+except ImportError:
+    unidecode_installed = False
+
+
+def slugify_unicode_stripping_prep(tag):
+    """
+    This handles stripping via unidecode if it's installed,
+    otherwise is a no-op
+    """
+    if unidecode_installed:
+        return unidecode(tag)
+    else:
         return tag
 
 
-class TagBase(models.Model):
-    name = models.CharField(verbose_name=_("Name"), unique=True, max_length=255)
-    slug = models.SlugField(verbose_name=_("Slug"), unique=True, max_length=255)
+class NaturalKeyManager(models.Manager):
+    def get_by_natural_key(self, *args):
+        if len(args) != len(self.model.natural_key_fields):
+            raise ValueError(
+                "Number of arguments does not match number of natural key fields."
+            )
+        lookup_kwargs = dict(zip(self.model.natural_key_fields, args))
+        return self.get(**lookup_kwargs)
+
+
+class NaturalKeyModel(models.Model):
+    def natural_key(self):
+        return [getattr(self, field) for field in self.natural_key_fields]
+
+    class Meta:
+        abstract = True
+
+
+class TagBase(NaturalKeyModel):
+    name = models.CharField(
+        verbose_name=pgettext_lazy("A tag name", "name"), unique=True, max_length=255
+    )
+    slug = models.SlugField(
+        verbose_name=pgettext_lazy("A tag slug", "slug"),
+        unique=True,
+        max_length=255,
+        allow_unicode=True,
+    )
+
+    natural_key_fields = ["name"]
+    objects = NaturalKeyManager()
 
     def __str__(self):
         return self.name
@@ -38,7 +80,7 @@ class TagBase(models.Model):
             # with a multi-master setup, theoretically we could try to
             # write and rollback on different DBs
             kwargs["using"] = using
-            # Be oportunistic and try to save the tag, this should work for
+            # Be opportunistic and try to save the tag, this should work for
             # most cases ;)
             try:
                 with transaction.atomic(using=using):
@@ -57,7 +99,7 @@ class TagBase(models.Model):
                 slug = self.slugify(self.name, i)
                 if slug not in slugs:
                     self.slug = slug
-                    # We purposely ignore concurrecny issues here for now.
+                    # We purposely ignore concurrency issues here for now.
                     # (That is, till we found a nice solution...)
                     return super().save(*args, **kwargs)
                 i += 1
@@ -65,25 +107,39 @@ class TagBase(models.Model):
             return super().save(*args, **kwargs)
 
     def slugify(self, tag, i=None):
-        slug = slugify(unidecode(tag))
+        if getattr(settings, "TAGGIT_STRIP_UNICODE_WHEN_SLUGIFYING", False):
+            slug = slugify(slugify_unicode_stripping_prep(tag))
+        else:
+            slug = slugify(tag, allow_unicode=True)
         if i is not None:
             slug += "_%d" % i
         return slug
 
 
+class TagQuerySet(models.QuerySet):
+
+    def orphaned(self):
+        return self.filter(taggit_taggeditem_items=None)
+
+
 class Tag(TagBase):
+
+    objects = NaturalKeyManager.from_queryset(TagQuerySet)()
+
     class Meta:
-        verbose_name = _("Tag")
-        verbose_name_plural = _("Tags")
+        verbose_name = _("tag")
+        verbose_name_plural = _("tags")
         app_label = "taggit"
 
 
-class ItemBase(models.Model):
+class ItemBase(NaturalKeyModel):
     def __str__(self):
         return gettext("%(object)s tagged with %(tag)s") % {
             "object": self.content_object,
             "tag": self.tag,
         }
+
+    objects = NaturalKeyManager()
 
     class Meta:
         abstract = True
@@ -125,7 +181,7 @@ class CommonGenericTaggedItemBase(ItemBase):
     content_type = models.ForeignKey(
         ContentType,
         on_delete=models.CASCADE,
-        verbose_name=_("Content type"),
+        verbose_name=_("content type"),
         related_name="%(app_label)s_%(class)s_tagged_items",
     )
     content_object = GenericForeignKey()
@@ -156,14 +212,16 @@ class CommonGenericTaggedItemBase(ItemBase):
 
 
 class GenericTaggedItemBase(CommonGenericTaggedItemBase):
-    object_id = models.IntegerField(verbose_name=_("Object id"), db_index=True)
+    object_id = models.IntegerField(verbose_name=_("object ID"), db_index=True)
+    natural_key_fields = ["object_id"]
 
     class Meta:
         abstract = True
 
 
 class GenericUUIDTaggedItemBase(CommonGenericTaggedItemBase):
-    object_id = models.UUIDField(verbose_name=_("Object id"), db_index=True)
+    object_id = models.UUIDField(verbose_name=_("object ID"), db_index=True)
+    natural_key_fields = ["object_id"]
 
     class Meta:
         abstract = True
@@ -171,8 +229,18 @@ class GenericUUIDTaggedItemBase(CommonGenericTaggedItemBase):
 
 class TaggedItem(GenericTaggedItemBase, TaggedItemBase):
     class Meta:
-        verbose_name = _("Tagged Item")
-        verbose_name_plural = _("Tagged Items")
+        verbose_name = _("tagged item")
+        verbose_name_plural = _("tagged items")
         app_label = "taggit"
-        index_together = [["content_type", "object_id"]]
-        unique_together = [["content_type", "object_id", "tag"]]
+        indexes = [
+            models.Index(
+                fields=["content_type", "object_id"],
+            )
+        ]
+
+        constraints = [
+            models.UniqueConstraint(
+                fields=("content_type", "object_id", "tag"),
+                name="taggit_taggeditem_content_type_id_object_id_tag_id_4bb97a8e_uniq",
+            )
+        ]

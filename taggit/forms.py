@@ -42,10 +42,22 @@ class TagField(forms.CharField):
         except forms.ValidationError:
             pass
 
-        if initial_value is None:
+        # normalize "empty values"
+        if not data_value:
+            data_value = []
+        if not initial_value:
             initial_value = []
 
         initial_value = [tag.name for tag in initial_value]
         initial_value.sort()
 
         return initial_value != data_value
+
+
+class MergeTagsForm(forms.Form):
+    new_tag_name = forms.CharField(
+        label="New Tag Name",
+        max_length=100,
+        widget=forms.TextInput(attrs={"id": "id_new_tag_name"}),
+        help_text="Enter new or existing tag name",
+    )

@@ -1,9 +1,10 @@
+import uuid
 from operator import attrgetter
 
-from django import VERSION
 from django.conf import settings
 from django.contrib.contenttypes.fields import GenericRelation
 from django.contrib.contenttypes.models import ContentType
+from django.core.exceptions import MultipleObjectsReturned
 from django.db import connections, models, router
 from django.db.models import signals
 from django.db.models.fields.related import (
@@ -13,11 +14,16 @@ from django.db.models.fields.related import (
     lazy_related_operation,
 )
 from django.db.models.query_utils import PathInfo
+from django.utils.functional import cached_property
 from django.utils.text import capfirst
 from django.utils.translation import gettext_lazy as _
 
 from taggit.forms import TagField
-from taggit.models import CommonGenericTaggedItemBase, TaggedItem
+from taggit.models import (
+    CommonGenericTaggedItemBase,
+    GenericUUIDTaggedItemBase,
+    TaggedItem,
+)
 from taggit.utils import require_instance_manager
 
 
@@ -27,6 +33,7 @@ class ExtraJoinRestriction:
     """
 
     contains_aggregate = False
+    contains_over_clause = False
 
     def __init__(self, alias, col, content_types):
         self.alias = alias
@@ -36,7 +43,7 @@ class ExtraJoinRestriction:
     def as_sql(self, compiler, connection):
         qn = compiler.quote_name_unless_alias
         if len(self.content_types) == 1:
-            extra_where = "{}.{} = %s".format(qn(self.alias), qn(self.col))
+            extra_where = f"{qn(self.alias)}.{qn(self.col)} = %s"
         else:
             extra_where = "{}.{} IN ({})".format(
                 qn(self.alias), qn(self.col), ",".join(["%s"] * len(self.content_types))
@@ -51,12 +58,27 @@ class ExtraJoinRestriction:
 
 
 class _TaggableManager(models.Manager):
-    def __init__(self, through, model, instance, prefetch_cache_name):
+    # TODO investigate whether we can use a RelatedManager instead of all this stuff
+    # to take advantage of all the Django goodness
+    def __init__(self, through, model, instance, prefetch_cache_name, ordering=None):
         super().__init__()
         self.through = through
         self.model = model
         self.instance = instance
         self.prefetch_cache_name = prefetch_cache_name
+
+        if ordering is not None:
+            self.ordering = ordering
+        elif instance:
+            # When working off an instance (i.e. instance.tags.all())
+            # we default to ordering by the PK of the through table
+            #
+            # (This ordering does not apply for queries at the model
+            #  level, i.e. Model.tags.all())
+            related_name = self.through.tag.field.related_query_name()
+            self.ordering = [f"{related_name}__pk"]
+        else:
+            self.ordering = []
 
     def is_cached(self, instance):
         return self.prefetch_cache_name in instance._prefetched_objects_cache
@@ -66,11 +88,24 @@ class _TaggableManager(models.Manager):
             return self.instance._prefetched_objects_cache[self.prefetch_cache_name]
         except (AttributeError, KeyError):
             kwargs = extra_filters if extra_filters else {}
-            return self.through.tags_for(self.model, self.instance, **kwargs)
+            return self.through.tags_for(self.model, self.instance, **kwargs).order_by(
+                *self.ordering
+            )
 
     def get_prefetch_queryset(self, instances, queryset=None):
-        if queryset is not None:
-            raise ValueError("Custom queryset can't be used for this lookup.")
+        if queryset is None:
+            return self.get_prefetch_querysets(instances)
+        else:
+            return self.get_prefetch_querysets(instances, [queryset])
+
+    def get_prefetch_querysets(self, instances, querysets=None):
+        if querysets is not None:
+            # this queryset is meant to be used for filtering down the prefetch
+            # this work has not been done yet.
+            #
+            # Some hint from Django: asserting that len(querysets) == 1 if it's not None
+            # and then using that to filter down the qs
+            raise ValueError("Custom querysets can't be used for this lookup.")
 
         instance = instances[0]
         db = self._db or router.db_for_read(type(instance), instance=instance)
@@ -102,32 +137,45 @@ class _TaggableManager(models.Manager):
                 }
             )
         )
-        if VERSION < (2, 0):
-            return (
-                qs,
-                attrgetter("_prefetch_related_val"),
-                lambda obj: obj._get_pk_val(),
-                False,
-                self.prefetch_cache_name,
-            )
+
+        if issubclass(self.through, GenericUUIDTaggedItemBase):
+
+            def uuid_rel_obj_attr(v):
+                value = attrgetter("_prefetch_related_val")(v)
+                if value is not None and not isinstance(value, uuid.UUID):
+                    input_form = "int" if isinstance(value, int) else "hex"
+                    value = uuid.UUID(**{input_form: value})
+                return value
+
+            rel_obj_attr = uuid_rel_obj_attr
         else:
-            return (
-                qs,
-                attrgetter("_prefetch_related_val"),
-                lambda obj: obj._get_pk_val(),
-                False,
-                self.prefetch_cache_name,
-                False,
-            )
+            rel_obj_attr = attrgetter("_prefetch_related_val")
+
+        return (
+            qs,
+            rel_obj_attr,
+            lambda obj: obj._get_pk_val(),
+            False,
+            self.prefetch_cache_name,
+            False,
+        )
 
     def _lookup_kwargs(self):
         return self.through.lookup_kwargs(self.instance)
 
+    def _remove_prefetched_objects(self):
+        prefetch_cache = getattr(self.instance, "_prefetched_objects_cache", None)
+        if prefetch_cache:
+            prefetch_cache.pop(self.prefetch_cache_name, None)
+
     @require_instance_manager
-    def add(self, *tags):
+    def add(self, *tags, through_defaults=None, tag_kwargs=None, **kwargs):
+        self._remove_prefetched_objects()
+        if tag_kwargs is None:
+            tag_kwargs = {}
         db = router.db_for_write(self.through, instance=self.instance)
 
-        tag_objs = self._to_tag_model_instances(tags)
+        tag_objs = self._to_tag_model_instances(tags, tag_kwargs)
         new_ids = {t.pk for t in tag_objs}
 
         # NOTE: can we hardcode 'tag_id' here or should the column name be got
@@ -152,7 +200,7 @@ class _TaggableManager(models.Manager):
 
         for tag in tag_objs:
             self.through._default_manager.using(db).get_or_create(
-                tag=tag, **self._lookup_kwargs()
+                tag=tag, **self._lookup_kwargs(), defaults=through_defaults
             )
 
         signals.m2m_changed.send(
@@ -165,21 +213,81 @@ class _TaggableManager(models.Manager):
             using=db,
         )
 
-    def _to_tag_model_instances(self, tags):
+    def _to_tag_model_instances(self, tags, tag_kwargs):
         """
         Takes an iterable containing either strings, tag objects, or a mixture
-        of both and returns set of tag objects.
+        of both and returns a list of tag objects while preserving order.
         """
         db = router.db_for_write(self.through, instance=self.instance)
 
-        str_tags = set()
-        tag_objs = set()
+        case_insensitive = getattr(settings, "TAGGIT_CASE_INSENSITIVE", False)
+        manager = self.through.tag_model()._default_manager.using(db)
 
+        # tags can be instances of our through models, or strings
+
+        tag_strs = [tag for tag in tags if isinstance(tag, str)]
+        # This map from tag names to tags lets us handle deduplication
+        # without doing extra queries along the way, all while relying on
+        # data we were going to pull out of the database anyways
+        # existing_tags_for_str[tag_name] = tag
+        existing_tags_for_str = {}
+        # we are going to first try and lookup existing tags (in a single query)
+        if case_insensitive:
+            # Some databases can do case-insensitive comparison with IN, which
+            # would be faster, but we can't rely on it or easily detect it
+            existing = []
+            tags_to_create = []
+            for name in tag_strs:
+                try:
+                    tag = manager.get(name__iexact=name, **tag_kwargs)
+                    existing_tags_for_str[name] = tag
+                except self.through.tag_model().DoesNotExist:
+                    tags_to_create.append(name)
+                except MultipleObjectsReturned:
+                    tag = (
+                        manager.filter(name__iexact=name, **tag_kwargs)
+                        .order_by("pk")
+                        .first()
+                    )
+                    existing_tags_for_str[name] = tag
+        else:
+            # Django is smart enough to not actually query if tag_strs is empty
+            # but importantly, this is a single query for all potential tags
+            existing = manager.filter(name__in=tag_strs, **tag_kwargs)
+            # we're going to end up doing this query anyways, so here is fine
+            for t in existing:
+                existing_tags_for_str[t.name] = t
+
+        result = []
+        # this set is used for deduplicating tags
+        seen_tags = set()
         for t in tags:
             if isinstance(t, self.through.tag_model()):
-                tag_objs.add(t)
+                if t not in seen_tags:
+                    seen_tags.add(t)
+                    result.append(t)
             elif isinstance(t, str):
-                str_tags.add(t)
+                # we are using a string, so either the tag exists (and we have the lookup)
+                # or we need to create the value
+
+                existing_tag = existing_tags_for_str.get(t, None)
+                if existing_tag is None:
+                    # we need to create a tag
+                    # (we use get_or_create to handle potential races)
+                    if case_insensitive:
+                        lookup = {"name__iexact": t, **tag_kwargs}
+                    else:
+                        lookup = {"name": t, **tag_kwargs}
+                    existing_tag, _ = manager.get_or_create(
+                        **lookup, defaults={"name": t}
+                    )
+                # we now have an existing tag for this string
+
+                # confirm if we've seen it or not (this is where case insensitivity comes
+                # into play)
+                if existing_tag not in seen_tags:
+                    seen_tags.add(existing_tag)
+                    result.append(existing_tag)
             else:
                 raise ValueError(
                     "Cannot add {} ({}). Expected {} or str.".format(
@@ -187,40 +295,7 @@ class _TaggableManager(models.Manager):
                     )
                 )
 
-        case_insensitive = getattr(settings, "TAGGIT_CASE_INSENSITIVE", False)
-        manager = self.through.tag_model()._default_manager.using(db)
-
-        if case_insensitive:
-            # Some databases can do case-insensitive comparison with IN, which
-            # would be faster, but we can't rely on it or easily detect it.
-            existing = []
-            tags_to_create = []
-
-            for name in str_tags:
-                try:
-                    tag = manager.get(name__iexact=name)
-                    existing.append(tag)
-                except self.through.tag_model().DoesNotExist:
-                    tags_to_create.append(name)
-        else:
-            # If str_tags has 0 elements Django actually optimizes that to not
-            # do a query.  Malcolm is very smart.
-            existing = manager.filter(name__in=str_tags)
-            tags_to_create = str_tags - {t.name for t in existing}
-
-        tag_objs.update(existing)
-
-        for new_tag in tags_to_create:
-            if case_insensitive:
-                tag, created = manager.get_or_create(
-                    name__iexact=new_tag, defaults={"name": new_tag}
-                )
-            else:
-                tag, created = manager.get_or_create(name=new_tag)
-
-            tag_objs.add(tag)
-
-        return tag_objs
+        return result
 
     @require_instance_manager
     def names(self):
@@ -231,22 +306,27 @@ class _TaggableManager(models.Manager):
         return self.get_queryset().values_list("slug", flat=True)
 
     @require_instance_manager
-    def set(self, *tags, **kwargs):
+    def set(self, tags, *, through_defaults=None, **kwargs):
         """
         Set the object's tags to the given n tags. If the clear kwarg is True
         then all existing tags are removed (using `.clear()`) and the new tags
         added. Otherwise, only those tags that are not present in the args are
         removed and any new tags added.
+
+        Any kwarg apart from 'clear' will be passed when adding tags.
+
         """
         db = router.db_for_write(self.through, instance=self.instance)
+
         clear = kwargs.pop("clear", False)
+        tag_kwargs = kwargs.pop("tag_kwargs", {})
 
         if clear:
             self.clear()
-            self.add(*tags)
+            self.add(*tags, **kwargs)
         else:
             # make sure we're working with a collection of a uniform type
-            objs = self._to_tag_model_instances(tags)
+            objs = self._to_tag_model_instances(tags, tag_kwargs)
 
             # get the existing tag strings
             old_tag_strs = set(
@@ -263,13 +343,14 @@ class _TaggableManager(models.Manager):
                     new_objs.append(obj)
 
             self.remove(*old_tag_strs)
-            self.add(*new_objs)
+            self.add(*new_objs, through_defaults=through_defaults, **kwargs)
 
     @require_instance_manager
     def remove(self, *tags):
         if not tags:
             return
 
+        self._remove_prefetched_objects()
         db = router.db_for_write(self.through, instance=self.instance)
 
         qs = (
@@ -302,6 +383,7 @@ class _TaggableManager(models.Manager):
 
     @require_instance_manager
     def clear(self):
+        self._remove_prefetched_objects()
         db = router.db_for_write(self.through, instance=self.instance)
 
         signals.m2m_changed.send(
@@ -361,8 +443,9 @@ class _TaggableManager(models.Manager):
                     % remote_field.field_name: [r["content_object"] for r in qs]
                 }
             )
+            actual_remote_field_name = f.target_field.get_attname()
             for obj in objs:
-                items[(getattr(obj, remote_field.field_name),)] = obj
+                items[(getattr(obj, actual_remote_field_name),)] = obj
         else:
             preload = {}
             for result in qs:
@@ -399,6 +482,7 @@ class TaggableManager(RelatedField):
         blank=False,
         related_name=None,
         to=None,
+        ordering=None,
         manager=_TaggableManager,
     ):
         self.through = through or TaggedItem
@@ -414,6 +498,7 @@ class TaggableManager(RelatedField):
             rel=rel,
         )
 
+        self.ordering = ordering
         self.swappable = False
         self.manager = manager
 
@@ -428,6 +513,7 @@ class TaggableManager(RelatedField):
             model=model,
             instance=instance,
             prefetch_cache_name=self.name,
+            ordering=self.ordering,
         )
 
     def deconstruct(self):
@@ -514,7 +600,7 @@ class TaggableManager(RelatedField):
                 )
 
     def save_form_data(self, instance, value):
-        getattr(instance, self.name).set(*value)
+        getattr(instance, self.name).set(value)
 
     def formfield(self, form_class=TagField, **kwargs):
         defaults = {
@@ -560,21 +646,24 @@ class TaggableManager(RelatedField):
         pathinfos = []
         linkfield1 = self.through._meta.get_field("content_object")
         linkfield2 = self.through._meta.get_field(self.m2m_reverse_field_name())
-        if direct:
-            if VERSION < (2, 0):
-                join1infos = linkfield1.get_reverse_path_info()
-                join2infos = linkfield2.get_path_info()
+        if not filtered_relation:
+            # Django >= 4.1 provides cached path_infos and reverse_path_infos properties
+            # to use in preference to get_path_info / get_reverse_path_info when not
+            # passing a filtered_relation
+            if direct:
+                join1infos = linkfield1.reverse_path_infos
+                join2infos = linkfield2.path_infos
             else:
+                join1infos = linkfield2.reverse_path_infos
+                join2infos = linkfield1.path_infos
+        else:
+            if direct:
                 join1infos = linkfield1.get_reverse_path_info(
                     filtered_relation=filtered_relation
                 )
                 join2infos = linkfield2.get_path_info(
                     filtered_relation=filtered_relation
                 )
-        else:
-            if VERSION < (2, 0):
-                join1infos = linkfield2.get_reverse_path_info()
-                join2infos = linkfield1.get_path_info()
             else:
                 join1infos = linkfield2.get_reverse_path_info(
                     filtered_relation=filtered_relation
@@ -592,54 +681,41 @@ class TaggableManager(RelatedField):
         opts = self.through._meta
         linkfield = self.through._meta.get_field(self.m2m_reverse_field_name())
         if direct:
-            if VERSION < (2, 0):
-                join1infos = [
-                    PathInfo(
-                        self.model._meta,
-                        opts,
-                        [from_field],
-                        self.remote_field,
-                        True,
-                        False,
-                    )
-                ]
-                join2infos = linkfield.get_path_info()
+            join1infos = [
+                PathInfo(
+                    self.model._meta,
+                    opts,
+                    [from_field],
+                    self.remote_field,
+                    True,
+                    False,
+                    filtered_relation,
+                )
+            ]
+            if not filtered_relation:
+                join2infos = linkfield.path_infos
             else:
-                join1infos = [
-                    PathInfo(
-                        self.model._meta,
-                        opts,
-                        [from_field],
-                        self.remote_field,
-                        True,
-                        False,
-                        filtered_relation,
-                    )
-                ]
                 join2infos = linkfield.get_path_info(
                     filtered_relation=filtered_relation
                 )
         else:
-            if VERSION < (2, 0):
-                join1infos = linkfield.get_reverse_path_info()
-                join2infos = [
-                    PathInfo(opts, self.model._meta, [from_field], self, True, False)
-                ]
+            if not filtered_relation:
+                join1infos = linkfield.reverse_path_infos
             else:
                 join1infos = linkfield.get_reverse_path_info(
                     filtered_relation=filtered_relation
                 )
-                join2infos = [
-                    PathInfo(
-                        opts,
-                        self.model._meta,
-                        [from_field],
-                        self,
-                        True,
-                        False,
-                        filtered_relation,
-                    )
-                ]
+            join2infos = [
+                PathInfo(
+                    opts,
+                    self.model._meta,
+                    [from_field],
+                    self,
+                    True,
+                    False,
+                    filtered_relation,
+                )
+            ]
         pathinfos.extend(join1infos)
         pathinfos.extend(join2infos)
         return pathinfos
@@ -654,6 +730,10 @@ class TaggableManager(RelatedField):
                 direct=True, filtered_relation=filtered_relation
             )
 
+    @cached_property
+    def path_infos(self):
+        return self.get_path_info()
+
     def get_reverse_path_info(self, filtered_relation=None):
         if self.use_gfk:
             return self._get_gfk_case_path_info(
@@ -664,13 +744,35 @@ class TaggableManager(RelatedField):
                 direct=False, filtered_relation=filtered_relation
             )
 
+    @cached_property
+    def reverse_path_infos(self):
+        return self.get_reverse_path_info()
+
     def get_joining_columns(self, reverse_join=False):
+        # RemovedInDjango60Warning
+        # https://github.com/django/django/commit/8b1ff0da4b162e87edebd94e61f2cd153e9e159d
         if reverse_join:
             return ((self.model._meta.pk.column, "object_id"),)
         else:
             return (("object_id", self.model._meta.pk.column),)
 
-    def get_extra_restriction(self, where_class, alias, related_alias):
+    def get_joining_fields(self, reverse_join=False):
+        if reverse_join:
+            return (
+                (
+                    self.model._meta.pk,
+                    self.remote_field.through._meta.get_field("object_id"),
+                ),
+            )
+        else:
+            return (
+                (
+                    self.remote_field.through._meta.get_field("object_id"),
+                    self.model._meta.pk,
+                ),
+            )
+
+    def get_extra_restriction(self, alias, related_alias):
         extra_col = self.through._meta.get_field("content_type").column
         content_type_ids = [
             ContentType.objects.get_for_model(subclass).pk
@@ -679,7 +781,12 @@ class TaggableManager(RelatedField):
         return ExtraJoinRestriction(related_alias, extra_col, content_type_ids)
 
     def get_reverse_joining_columns(self):
+        # RemovedInDjango60Warning
+        # https://github.com/django/django/commit/8b1ff0da4b162e87edebd94e61f2cd153e9e159d
         return self.get_joining_columns(reverse_join=True)
+
+    def get_reverse_joining_fields(self):
+        return self.get_joining_fields(reverse_join=True)
 
     @property
     def related_fields(self):
